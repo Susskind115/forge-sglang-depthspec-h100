@@ -68,6 +68,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     topk_index: torch.Tensor
     draft_probs: Optional[torch.Tensor]
     hidden_states: Optional[torch.Tensor]
+    prefix_handoff_hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     dsa_seed_topk: Optional[torch.Tensor] = None
@@ -95,6 +96,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         *,
         draft_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
+        capture_forward_kind: Optional[str] = None,
+        prefix_handoff_hidden_size: Optional[int] = None,
     ):
         # Parse args
         self.eagle_worker = eagle_worker
@@ -126,6 +129,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.draft_attn_backend = draft_attn_backend or model_runner.draft_attn_backend
+        self.capture_forward_kind = capture_forward_kind
+        self.prefix_handoff_hidden_size = prefix_handoff_hidden_size
 
         # Patch_model in parent's capture() needs an attn_backend reference.
         # EAGLE doesn't use it (capture_one_shape calls draft_forward instead),
@@ -206,6 +211,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 if _hidden_size is not None
                 else None
             )
+            prefix_handoff_hidden_states = (
+                torch.zeros(
+                    (self.max_num_token, prefix_handoff_hidden_size),
+                    dtype=model_runner.model_config.dtype,
+                )
+                if prefix_handoff_hidden_size is not None
+                else None
+            )
 
             self.temperatures = torch.ones((self.max_bs, 1), dtype=torch.float)
 
@@ -256,6 +269,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_index=topk_index,
             draft_probs=draft_probs,
             hidden_states=hidden_states,
+            prefix_handoff_hidden_states=prefix_handoff_hidden_states,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk=dsa_seed_topk,
@@ -265,6 +279,19 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.backend = resolve_decode_backend(self)
 
         # Capture
+        capture_model = self.model_runner.model
+        old_forward_kind = getattr(capture_model, "depthspec_forward_kind", "target")
+        old_prefix_handoff = getattr(
+            capture_model,
+            "depthspec_prefix_handoff_hidden_states",
+            None,
+        )
+        if self.capture_forward_kind is not None:
+            capture_model.depthspec_forward_kind = self.capture_forward_kind
+        if prefix_handoff_hidden_states is not None:
+            capture_model.depthspec_prefix_handoff_hidden_states = (
+                prefix_handoff_hidden_states
+            )
         try:
             with model_capture_mode():
                 self.capture()
@@ -272,6 +299,15 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+        finally:
+            capture_model.depthspec_forward_kind = old_forward_kind
+            if old_prefix_handoff is None:
+                if hasattr(capture_model, "depthspec_prefix_handoff_hidden_states"):
+                    del capture_model.depthspec_prefix_handoff_hidden_states
+            else:
+                capture_model.depthspec_prefix_handoff_hidden_states = (
+                    old_prefix_handoff
+                )
 
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
@@ -530,6 +566,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.draft_probs.zero_()
             if buffers.hidden_states is not None:
                 buffers.hidden_states.zero_()
+            if buffers.prefix_handoff_hidden_states is not None:
+                buffers.prefix_handoff_hidden_states.zero_()
             if buffers.dsa_seed_topk is not None:
                 buffers.dsa_seed_topk.zero_()
             buffers.req_pool_indices.zero_()
@@ -591,6 +629,24 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             and forward_batch.spec_info.hidden_states is not None
         ):
             buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        if buffers.prefix_handoff_hidden_states is not None:
+            prefix_handoff_hidden_states = getattr(
+                forward_batch.spec_info,
+                "depthspec_prefix_handoff_hidden_states",
+                None,
+            )
+            if prefix_handoff_hidden_states is None:
+                raise ValueError(
+                    "Canonical proposal graph requires prefix handoff hidden states"
+                )
+            if prefix_handoff_hidden_states.shape[0] != raw_num_token:
+                raise ValueError(
+                    "Canonical proposal graph hidden row mismatch: "
+                    f"{prefix_handoff_hidden_states.shape[0]} != {raw_num_token}"
+                )
+            buffers.prefix_handoff_hidden_states[:raw_num_token].copy_(
+                prefix_handoff_hidden_states
+            )
         if buffers.dsa_seed_topk is not None:
             seed = forward_batch.spec_info.dsa_topk_indices
             if seed is not None:

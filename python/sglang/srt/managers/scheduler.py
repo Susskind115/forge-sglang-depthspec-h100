@@ -986,8 +986,37 @@ class Scheduler(
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
-        self.tp_worker.init_cuda_graphs()
-        if self.draft_worker is not None:
+        draft_worker = self.draft_worker
+        inner_draft_worker = (
+            getattr(draft_worker, "_draft_worker", draft_worker)
+            if draft_worker is not None
+            else None
+        )
+        runtime_config = getattr(inner_draft_worker, "runtime_config", None)
+        target_graph_mode = (
+            runtime_config.target_verify_graph_mode
+            if runtime_config is not None
+            else "auto"
+        )
+        capture_target_decode_graph = target_graph_mode != "disabled"
+        if draft_worker is not None:
+            unified_runner = bool(getattr(inner_draft_worker, "unified_runner", False))
+            if unified_runner:
+                # The unified runner reuses the target TpModelWorker. Its
+                # default is eager target verification because the current
+                # captured attention path is slower. Explicit opt-in captures
+                # draft graphs first, then restores the target graph runner.
+                draft_worker.init_cuda_graphs()
+                explicitly_enable_target_graph = target_graph_mode == "enabled"
+                if explicitly_enable_target_graph and capture_target_decode_graph:
+                    self.tp_worker.init_cuda_graphs(
+                        capture_decode_cuda_graph=capture_target_decode_graph
+                    )
+                return
+        self.tp_worker.init_cuda_graphs(
+            capture_decode_cuda_graph=capture_target_decode_graph
+        )
+        if draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
     def init_model_worker(self):
@@ -2125,13 +2154,23 @@ class Scheduler(
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
-            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
+            get_total_prefill_uncached_tokens=lambda: (
+                self.total_prefill_uncached_tokens
+            ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
@@ -3308,9 +3347,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 

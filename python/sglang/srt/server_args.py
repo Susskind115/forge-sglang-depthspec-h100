@@ -2112,6 +2112,24 @@ class ServerArgs:
         "The number of tokens sampled from the draft model in Speculative Decoding.",
         NS("spec"),
     ] = None
+    depthspec_runtime_profile: A[
+        Literal["auto", "legacy", "canonical-faas", "diagnostic"],
+        Arg(
+            help=(
+                "DepthSpec runtime policy. 'auto' selects the validated LoopFormer "
+                "fast path, 'legacy' preserves the generic STANDALONE path, "
+                "'canonical-faas' enables the research forward-service path, and "
+                "'diagnostic' combines the auto policy with a diagnostics config."
+            ),
+            choices=["auto", "legacy", "canonical-faas", "diagnostic"],
+        ),
+        NS("spec"),
+    ] = "auto"
+    depthspec_diagnostics_config: A[
+        Optional[str],
+        "Path to one JSON object containing cold-path DepthSpec diagnostics options.",
+        NS("spec"),
+    ] = None
     speculative_dflash_block_size: A[
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",

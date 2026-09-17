@@ -34,6 +34,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.speculative.depthspec_runtime_config import (
+    get_active_depthspec_runtime_config,
+)
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -355,9 +358,9 @@ class TritonAttnBackend(AttentionBackend):
         # And the real_num_token is num_seq in decoding phase.
         num_group = num_token // num_seq
 
-        assert (
-            num_group * num_seq == num_token
-        ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
+        assert num_group * num_seq == num_token, (
+            f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
+        )
 
         if (
             self.static_kv_splits or self.device_core_count <= 0
@@ -583,10 +586,15 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens = seq_lens[:bs]
         # V2 draft-extend fills num_draft_tokens per req; num_steps+1 only equals
         # that when topk == 1.
-        num_tokens_per_req = (
+        default_draft_extend_width = (
             self.num_draft_tokens
             if forward_mode.is_draft_extend_v2()
             else self.speculative_num_steps + 1
+        )
+        num_tokens_per_req = getattr(
+            self,
+            "depthspec_draft_extend_num_tokens_per_req",
+            default_draft_extend_width,
         )
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
@@ -858,6 +866,9 @@ class TritonAttnBackend(AttentionBackend):
                 and getattr(spec_info, "draft_token_num", None) is not None
             ):
                 num_draft_tokens = int(spec_info.draft_token_num)
+            num_kv_tokens = getattr(
+                spec_info, "num_kv_tokens_per_req", num_draft_tokens
+            )
             qo_indptr = torch.arange(
                 0,
                 (1 + bs) * num_draft_tokens,
@@ -865,6 +876,15 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
+            align_normal_extend_metadata = self.topk == 1 and bool(
+                get_active_depthspec_runtime_config().diagnostics.get(
+                    "verify_align_normal_metadata", False
+                )
+            )
+            if align_normal_extend_metadata:
+                # Audit-only path for a pure causal chain: use the same qo index
+                # dtype and no custom-mask specialization as ordinary EXTEND.
+                qo_indptr = qo_indptr.to(torch.int64)
             # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
             seq_lens_sum = forward_batch.seq_lens_sum
             if seq_lens_sum is None:
@@ -897,13 +917,18 @@ class TritonAttnBackend(AttentionBackend):
                     self.token_to_kv_pool,
                 )
 
-            custom_mask = spec_info.custom_mask
-            seq_mask_len = num_draft_tokens * (
-                forward_batch.seq_lens + num_draft_tokens
+            custom_mask = (
+                None if align_normal_extend_metadata else spec_info.custom_mask
             )
-            mask_indptr = self.mask_indptr
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
-            mask_indptr = mask_indptr[: bs + 1]
+            seq_mask_len = num_draft_tokens * (
+                forward_batch.seq_lens + num_kv_tokens
+            )
+            if align_normal_extend_metadata:
+                mask_indptr = None
+            else:
+                mask_indptr = self.mask_indptr
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
+                mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = num_draft_tokens
             num_kv_splits = None
             attn_logits = None
@@ -1185,10 +1210,14 @@ class TritonAttnBackend(AttentionBackend):
                 # build qo_indptr above, else the extend kernel grid is too small
                 # for topk > 1 (num_draft_tokens > num_steps+1) and drops query
                 # blocks.
-                max_extend_len=(
-                    self.num_draft_tokens
-                    if forward_mode.is_draft_extend_v2()
-                    else self.speculative_num_steps + 1
+                max_extend_len=getattr(
+                    self,
+                    "depthspec_draft_extend_num_tokens_per_req",
+                    (
+                        self.num_draft_tokens
+                        if forward_mode.is_draft_extend_v2()
+                        else self.speculative_num_steps + 1
+                    ),
                 ),
                 num_kv_splits=None,
                 kv_indptr=self.kv_indptr[: bs + 1],
@@ -1378,8 +1407,18 @@ class TritonAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
             )
 
+        # Query subsets read a full-tree KV layout. The regular two-stage
+        # kernel would append those query rows again after the full tree.
+        preserve_full_tree_kv = bool(
+            getattr(
+                forward_batch.spec_info,
+                "depthspec_preserve_full_tree_kv",
+                False,
+            )
+        )
+
         # Deterministic mode: use unified 1-stage kernel
-        if self.enable_deterministic:
+        if self.enable_deterministic or preserve_full_tree_kv:
             return self._forward_extend_unified(
                 q,
                 o,
@@ -1732,16 +1771,25 @@ class TritonAttnBackend(AttentionBackend):
         else:
             extend_start_loc = forward_batch.extend_start_loc
 
-        unified_kv_indptr, unified_kv_indices, prefix_lens = (
-            self.build_unified_kv_indices(
-                prefix_kv_indptr,
-                prefix_kv_indices,
-                extend_start_loc,
-                extend_seq_lens,
-                extend_kv_indices,
-                bs,
+        if getattr(forward_batch.spec_info, "depthspec_preserve_full_tree_kv", False):
+            unified_kv_indptr = prefix_kv_indptr
+            unified_kv_indices = prefix_kv_indices
+            prefix_lens = (
+                forward_batch.seq_lens[:bs]
+                - forward_batch.spec_info.num_kv_tokens_per_req
             )
-        )
+        else:
+            unified_kv_indptr, unified_kv_indices, prefix_lens = (
+                self.build_unified_kv_indices(
+                    prefix_kv_indptr,
+                    prefix_kv_indices,
+                    extend_start_loc,
+                    extend_seq_lens,
+                    extend_kv_indices,
+                    bs,
+                )
+            )
+        del extend_kv_indices
 
         # Convert prefix_lens to int32 for the kernel
         prefix_lens = prefix_lens.to(torch.int32)

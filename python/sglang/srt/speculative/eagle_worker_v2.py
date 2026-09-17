@@ -1,7 +1,9 @@
 import contextlib
+import json
 import logging
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import List, Optional
 
 import torch
@@ -60,6 +62,9 @@ from sglang.srt.speculative.adaptive_runtime_state import (
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.depthspec_runtime_config import (
+    get_depthspec_runtime_config,
+)
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -744,20 +749,78 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        target_aligned_layout = (
+            self.speculative_algorithm.is_standalone()
+            and get_depthspec_runtime_config(self.draft_runner).target_aligned_layout
+        )
+        layout_audit_path = get_depthspec_runtime_config(
+            self.draft_runner
+        ).diagnostics.get("standalone_layout_audit_path")
+        saved_batch_state = None
+
         # Construct input_ids
+        original_input_ids = (
+            batch.input_ids.clone() if layout_audit_path else None
+        )
         if not batch.forward_mode.is_idle():
-            # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
-            new_input_ids = torch.empty_like(batch.input_ids)
-            pt = 0
-            for i, extend_len in enumerate(batch.extend_lens):
-                input_ids = batch.input_ids[pt : pt + extend_len]
-                new_input_ids[pt : pt + extend_len].copy_(
-                    torch.cat((input_ids[1:], tail_tokens[i].reshape(1)))
-                )
-                pt += extend_len
-            assert pt == batch.input_ids.numel()
-            batch.input_ids = new_input_ids
+            if target_aligned_layout:
+                from sglang.srt.mem_cache.allocation import alloc_for_decode
+
+                saved_batch_state = {
+                    "input_ids": batch.input_ids,
+                    "out_cache_loc": batch.out_cache_loc,
+                    "extend_lens": batch.extend_lens,
+                    "extend_num_tokens": batch.extend_num_tokens,
+                    "seq_lens": batch.seq_lens,
+                    "seq_lens_cpu": batch.seq_lens_cpu,
+                    "seq_lens_sum": batch.seq_lens_sum,
+                    "spec_info": batch.spec_info,
+                }
+                root_cache_locs = alloc_for_decode(batch, token_per_req=1)
+                aligned_input_ids = []
+                aligned_cache_locs = []
+                pt = 0
+                for request_index, extend_len in enumerate(batch.extend_lens):
+                    aligned_input_ids.append(
+                        torch.cat(
+                            (
+                                batch.input_ids[pt : pt + extend_len],
+                                tail_tokens[request_index].reshape(1),
+                            )
+                        )
+                    )
+                    aligned_cache_locs.append(
+                        torch.cat(
+                            (
+                                batch.out_cache_loc[pt : pt + extend_len],
+                                root_cache_locs[request_index].reshape(1),
+                            )
+                        )
+                    )
+                    pt += extend_len
+                assert pt == batch.input_ids.numel()
+                batch.input_ids = torch.cat(aligned_input_ids)
+                batch.out_cache_loc = torch.cat(aligned_cache_locs)
+                batch.extend_lens = [length + 1 for length in batch.extend_lens]
+                batch.extend_num_tokens += len(batch.extend_lens)
+                batch.seq_lens = batch.seq_lens + 1
+                if batch.seq_lens_cpu is not None:
+                    batch.seq_lens_cpu = batch.seq_lens_cpu + 1
+                if batch.seq_lens_sum is not None:
+                    batch.seq_lens_sum += len(batch.extend_lens)
+            else:
+                # Chunked-prefill-aware tail tokens (see PR #26329).
+                new_input_ids = torch.empty_like(batch.input_ids)
+                pt = 0
+                for i, extend_len in enumerate(batch.extend_lens):
+                    input_ids = batch.input_ids[pt : pt + extend_len]
+                    new_input_ids[pt : pt + extend_len].copy_(
+                        torch.cat((input_ids[1:], tail_tokens[i].reshape(1)))
+                    )
+                    pt += extend_len
+                assert pt == batch.input_ids.numel()
+                batch.input_ids = new_input_ids
 
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
@@ -785,6 +848,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
+
+        if layout_audit_path and self.speculative_algorithm.is_standalone():
+            row = {
+                "phase": "prefill",
+                "original_input_ids": original_input_ids.detach().cpu().tolist(),
+                "draft_input_ids": forward_batch.input_ids.detach().cpu().tolist(),
+                "draft_positions": forward_batch.positions.detach().cpu().tolist(),
+                "draft_out_cache_loc": forward_batch.out_cache_loc.detach()
+                .cpu()
+                .tolist(),
+                "seq_lens": forward_batch.seq_lens.detach().cpu().tolist(),
+                "root_tokens": next_token_ids.detach().cpu().tolist(),
+            }
+            output = Path(layout_audit_path)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with output.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(row) + "\n")
 
         # Seed the first draft-decode loop from each request's last prefill
         # position. Gather last-per-req before the copy (prefill can be long).
@@ -832,7 +912,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-        return EagleDraftInput(
+        result = EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
             draft_probs=probs if use_rejection_sampling else None,
@@ -842,6 +922,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_for_logprob_per_req=1,
             dsa_topk_indices=prefill_dsa_topk,
         )
+        if saved_batch_state is not None:
+            for name, value in saved_batch_state.items():
+                setattr(batch, name, value)
+        return result
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
         """Lazily-grown int32 [num_tokens, index_topk] eager draft-extend seed buffer."""

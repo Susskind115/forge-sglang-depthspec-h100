@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import time
 from typing import TYPE_CHECKING, Any, Optional
+from pathlib import Path
 
 import torch
 
@@ -14,6 +17,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+)
+from sglang.srt.speculative.depthspec_runtime_config import (
+    get_active_depthspec_runtime_config,
+    get_depthspec_runtime_config,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
@@ -37,9 +44,23 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+def _append_verify_phase_timing(rows: list[dict]) -> None:
+    """Optionally record wall times for all target-verify subphases."""
+    timing_path = get_active_depthspec_runtime_config().diagnostics.get(
+        "verify_phase_timing_path"
+    )
+    if not timing_path:
+        return
+    path = Path(timing_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row) + "\n")
+
 
 if _is_cpu:
     from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
@@ -115,6 +136,11 @@ def prepare_for_draft_extend(
     widened_positions: Optional[torch.Tensor] = None,
 ):
     bs = len(batch.seq_lens)
+    target_aligned_layout = (
+        draft_model_runner.spec_algorithm.is_standalone()
+        and get_depthspec_runtime_config(draft_model_runner).target_aligned_layout
+    )
+    position_offset = 1 if target_aligned_layout else 0
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
     # rows below the boundary. Locs/positions arrive precomputed; token/hidden
     # buffers are zeroed placeholders the caller fills after the plan-stream join.
@@ -144,6 +170,23 @@ def prepare_for_draft_extend(
                     (extend_num_tokens, draft_extend_input.hidden_states.shape[1])
                 )
             )
+    elif target_aligned_layout and not batch.forward_mode.is_idle():
+        transition_offsets = torch.arange(
+            num_draft_tokens, device=batch.device, dtype=torch.int64
+        )
+        transition_positions = (
+            batch.seq_lens[:, None]
+            + position_offset
+            + transition_offsets[None, :]
+        )
+        request_rows = batch.req_to_token_pool.req_to_token[
+            batch.req_pool_indices.long()
+        ]
+        batch.input_ids = predict
+        batch.out_cache_loc = torch.gather(
+            request_rows, 1, transition_positions
+        ).reshape(-1)
+        draft_extend_input.positions = transition_positions.reshape(-1)
     else:
         batch.input_ids = predict
     maybe_detect_oob(
@@ -155,13 +198,16 @@ def prepare_for_draft_extend(
     # init_new requires both list or both Tensor;
     # gpu_only emits device tensors to skip H2D.
     if gpu_only:
-        batch.prefix_lens = (batch.seq_lens - front_offset).clamp(min=0).to(torch.int32)
+        batch.prefix_lens = (
+            batch.seq_lens + position_offset - front_offset
+        ).clamp(min=0).to(torch.int32)
         batch.extend_lens = torch.full(
             (bs,), num_window_tokens, dtype=torch.int32, device=batch.seq_lens.device
         )
     else:
         batch.prefix_lens = [
-            max(int(x) - front_offset, 0) for x in batch.seq_lens_cpu.tolist()
+            max(int(x) + position_offset - front_offset, 0)
+            for x in batch.seq_lens_cpu.tolist()
         ]
         batch.extend_lens = [num_window_tokens] * bs
     batch.extend_num_tokens = extend_num_tokens
@@ -183,9 +229,13 @@ def prepare_for_draft_extend(
     )
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
-    forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
+    forward_batch.seq_lens = (
+        forward_batch.seq_lens + position_offset + num_draft_tokens
+    )
     if not gpu_only:
-        forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
+        forward_batch.seq_lens_cpu = (
+            forward_batch.seq_lens_cpu + position_offset + num_draft_tokens
+        )
         forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
     else:
         # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
@@ -219,6 +269,13 @@ def prepare_for_draft(
     num_steps: int,
 ):
 
+    target_aligned_layout = (
+        draft_model_runner.spec_algorithm.is_standalone()
+        and get_depthspec_runtime_config(draft_model_runner).target_aligned_layout
+    )
+    position_offset = 1 if target_aligned_layout else 0
+    draft_seq_lens = batch.seq_lens + position_offset
+
     if not batch.forward_mode.is_idle():
         bs = len(batch.seq_lens)
 
@@ -234,7 +291,7 @@ def prepare_for_draft(
                 assign_draft_cache_locs_contiguous_cpu(
                     batch.req_pool_indices,
                     req_to_token_pool.req_to_token,
-                    batch.seq_lens,
+                    draft_seq_lens,
                     batch.out_cache_loc,
                     req_to_token_pool.req_to_token.shape[1],
                     topk,
@@ -260,7 +317,7 @@ def prepare_for_draft(
             # base is batch.seq_lens (== KV-ready committed prefix at draft time;
             # the bonus is the tree root written by verify, not part of [0:seq_lens]).
             rows = req_to_token_pool.req_to_token[batch.req_pool_indices.long()]
-            seq_lens = batch.seq_lens.to(torch.int64)
+            seq_lens = draft_seq_lens.to(torch.int64)
             last_page = seq_lens % page_size
             prefix_base = seq_lens - last_page
             num_new_pages = (last_page + num_steps + page_size - 1) // page_size
@@ -300,13 +357,25 @@ def prepare_for_draft(
         if draft_model_runner.spec_algorithm.is_standalone()
         else CaptureHiddenMode.LAST
     )
-    draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+    draft_input.positions = draft_seq_lens.repeat_interleave(topk, dim=0)
+    if get_depthspec_runtime_config(draft_model_runner).diagnostics.get(
+        "standalone_layout_audit_path"
+    ):
+        draft_input.depthspec_initial_positions = draft_input.positions.clone()
     forward_batch = ForwardBatch.init_new(
         batch,
         draft_model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
     )
+    if position_offset and not batch.forward_mode.is_idle():
+        forward_batch.seq_lens = forward_batch.seq_lens + position_offset
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.seq_lens_cpu = (
+                forward_batch.seq_lens_cpu + position_offset
+            )
+        if forward_batch.seq_lens_sum is not None:
+            forward_batch.seq_lens_sum += forward_batch.batch_size * position_offset
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
@@ -485,21 +554,47 @@ def run_eagle_verify(
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
     """
+    phase_timing = bool(
+        get_active_depthspec_runtime_config().diagnostics.get(
+            "verify_phase_timing_path"
+        )
+    )
+    phase_last = time.perf_counter() if phase_timing else 0.0
+    phase_rows: list[dict] = []
+
+    def mark_phase(name: str, use_cuda_graph: bool = False) -> None:
+        nonlocal phase_last
+        if not phase_timing:
+            return
+        now = time.perf_counter()
+        phase_rows.append(
+            {
+                "phase": name,
+                "batch_size": len(batch.seq_lens),
+                "elapsed_s": now - phase_last,
+                "use_cuda_graph": use_cuda_graph,
+            }
+        )
+        phase_last = now
+
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
+    mark_phase("record_stream")
 
     bs = len(batch.seq_lens)
 
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
-    with plan_stream_ctx:
-        verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
-            verify_input,
-            req_to_token_pool,
-            batch,
-            target_worker,
-        )
+    with profile_range("depthspec.verify.prepare"):
+        with plan_stream_ctx:
+            verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
+                verify_input,
+                req_to_token_pool,
+                batch,
+                target_worker,
+            )
+    mark_phase("prepare")
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
     record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
@@ -531,6 +626,7 @@ def run_eagle_verify(
                 else None
             ),
         )
+    mark_phase("update_after_draft")
 
     # Must stay ahead of the target verify launch below.
     grammar_tree = (
@@ -559,12 +655,19 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
-    forward_batch_output = target_worker.forward_batch_generation(
-        batch=None,
-        forward_batch=verify_forward_batch,
-        is_verify=True,
+    target_forward_span = (
+        "depthspec.verify.target_forward_graph"
+        if can_run_cuda_graph
+        else "depthspec.verify.target_forward_eager"
     )
+    with profile_range(target_forward_span):
+        forward_batch_output = target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+        )
     logits_output = forward_batch_output.logits_output
+    mark_phase("target_forward", use_cuda_graph=can_run_cuda_graph)
 
     # Generate vocab mask for constrained decoding
     grammar_mask = None
@@ -580,11 +683,13 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    (
-        predict,
-        accept_lens,
-        accept_index,
-    ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+    with profile_range("depthspec.verify.sample_accept"):
+        (
+            predict,
+            accept_lens,
+            accept_index,
+        ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+    mark_phase("sample_accept")
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
@@ -629,18 +734,30 @@ def run_eagle_verify(
     if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
         # topk == 1 needs nothing here: the accepted path is already the front
         # chain, so the whole compaction is an identity transform.
-        predict = _finalize_accept_tree_path(
-            batch,
-            accept_index,
-            accept_lens,
-            predict,
-            logits_output,
-            bs,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            num_draft_tokens=num_draft_tokens,
-        )
+        with profile_range("depthspec.verify.finalize"):
+            predict = _finalize_accept_tree_path(
+                batch,
+                accept_index,
+                accept_lens,
+                predict,
+                logits_output,
+                bs,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+                num_draft_tokens=num_draft_tokens,
+            )
+    mark_phase("finalize")
+    _append_verify_phase_timing(phase_rows)
 
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+    next_draft_input.accept_index = accept_index
+    next_draft_input.candidate_tokens = verify_input.draft_token.reshape(
+        bs,
+        verify_input.draft_token_num,
+    )
+    next_draft_input.candidate_positions = verify_input.positions.reshape(
+        bs,
+        verify_input.draft_token_num,
+    )
 
     # verify_forward_batch transitively holds verify-time GPU tensors
     # (draft_token / out_cache_loc / ...) that must outlive the imminent

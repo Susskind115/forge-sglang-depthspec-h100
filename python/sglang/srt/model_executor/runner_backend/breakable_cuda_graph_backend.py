@@ -19,6 +19,7 @@ No torch.compile.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import dataclasses
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
@@ -65,6 +66,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
     ) -> None:
+        self._runner = cuda_graph_runner
         self._model_runner = cuda_graph_runner.model_runner
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
@@ -124,6 +126,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
         size = shape_key.size
+        if self._runner.capture_forward_mode.is_target_verify():
+            size *= int(self._runner.captured_req_width)
         if self._shared_output_buffer is None:
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
         with BreakableCUDAGraphCapture(
@@ -155,6 +159,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return min([cap, *rows])
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
+        if dataclasses.is_dataclass(output):
+            rows = [
+                self._output_rows(getattr(output, field.name), cap)
+                for field in dataclasses.fields(output)
+                if isinstance(getattr(output, field.name), torch.Tensor)
+            ]
+            return min([cap, *rows]) if rows else cap
         return cap
 
     def _alloc_full_buffer(self, output: Any, size: int) -> Any:
@@ -174,6 +185,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
             return [self._alloc_full_buffer(o, size) for o in output]
+        if dataclasses.is_dataclass(output):
+            return type(output)(
+                **{
+                    field.name: self._alloc_full_buffer(
+                        getattr(output, field.name), size
+                    )
+                    for field in dataclasses.fields(output)
+                }
+            )
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
@@ -187,6 +207,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
+        if dataclasses.is_dataclass(output):
+            return type(output)(
+                **{
+                    field.name: self._slice_output(
+                        getattr(output, field.name), num_tokens
+                    )
+                    for field in dataclasses.fields(output)
+                }
+            )
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _copy_output_to_buffer(
@@ -225,6 +254,19 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 )
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
+            return
+        if dataclasses.is_dataclass(output) and dataclasses.is_dataclass(output_buffer):
+            if type(output) is not type(output_buffer):
+                raise ValueError(
+                    "BCG output dataclass changed: "
+                    f"{type(output)} vs {type(output_buffer)}"
+                )
+            for field in dataclasses.fields(output):
+                self._copy_output_to_buffer(
+                    getattr(output, field.name),
+                    getattr(output_buffer, field.name),
+                    num_tokens,
+                )
             return
         raise TypeError(
             "Unsupported BCG output buffer pair: "

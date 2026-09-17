@@ -33,12 +33,19 @@ class EagleVerifyInput(SpecInput):
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
+    # Width of the KV tree exposed to attention. It differs from the query
+    # width when an executor computes only a subset of tree rows.
+    num_kv_tokens_per_req: int = -1
+    # Execute only selected query rows while attention reads the full tree.
+    depthspec_preserve_full_tree_kv: bool = False
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
         self.num_tokens_for_logprob_per_req = self.draft_token_num
+        if self.num_kv_tokens_per_req < 0:
+            self.num_kv_tokens_per_req = self.draft_token_num
 
     @property
     def max_tree_depth(self) -> int:

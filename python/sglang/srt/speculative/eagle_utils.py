@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import math
+import json
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional, Tuple
+from pathlib import Path
 
 import torch
 
@@ -17,6 +19,9 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.speculative.depthspec_runtime_config import (
+    get_depthspec_runtime_config,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -558,12 +563,33 @@ def eagle_prepare_for_verify(
     )
 
     # Run attention backend plan and cuda graph preparation
+    graph_runner = target_worker.model_runner.decode_cuda_graph_runner
     can_run_cuda_graph = bool(
-        target_worker.model_runner.decode_cuda_graph_runner
-        and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
-            verify_forward_batch
-        )
+        graph_runner and graph_runner.can_run_graph(verify_forward_batch)
     )
+    runtime_config = get_depthspec_runtime_config(target_worker)
+    graph_audit_path = runtime_config.diagnostics.get("target_graph_audit_path")
+    if graph_audit_path:
+        spec_width = getattr(verify_forward_batch.spec_info, "num_tokens_per_req", None)
+        row = {
+            "runner_type": type(graph_runner).__name__,
+            "runner_module": type(graph_runner).__module__,
+            "forward_mode": str(verify_forward_batch.forward_mode),
+            "batch_size": int(verify_forward_batch.batch_size),
+            "input_ids_numel": int(verify_forward_batch.input_ids.numel()),
+            "spec_width": int(spec_width) if spec_width is not None else None,
+            "captured_req_width": getattr(graph_runner, "captured_req_width", None),
+            "max_bs": getattr(graph_runner, "max_bs", None),
+            "replace_embeds": verify_forward_batch.replace_embeds is not None,
+            "ragged_verify_mode": getattr(graph_runner, "ragged_verify_mode", None),
+            "can_run_cuda_graph": can_run_cuda_graph,
+        }
+        audit_path = Path(graph_audit_path)
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with audit_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row) + "\n")
+    if runtime_config.target_verify_graph_mode == "disabled":
+        can_run_cuda_graph = False
     if can_run_cuda_graph:
         target_worker.model_runner.decode_cuda_graph_runner.load_batch(
             verify_forward_batch
